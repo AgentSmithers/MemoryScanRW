@@ -102,6 +102,8 @@ AgentSmithers MemoryScanRW is a command-line utility for Windows, written in C++
 * `stopwatch`: Stops the `watch` thread.
 * `dump`: Prints loaded modules of the target process and dumps the currently cached memory addresses with their values.
 * `recentlyremoved`: (Not Yet Implemented)
+* `freeze`: Continuously writes each cached address's stored value back to memory (~100 writes/sec), effectively locking the value in place. The game/process cannot change frozen addresses until `unfreeze` is issued.
+* `unfreeze`: Stops the freeze thread, allowing the target process to modify the previously frozen addresses again.
 
 ### Hooking (Experimental)
 * `hook`: Attempts an experimental hook on `GetTickCount` within the tool's own process.
