@@ -44,42 +44,114 @@ public:
 
 class MemoryEntry {
 public:
-    int value = 0; //Used for Single byte checks
-    //byte ByteArray[4];
-    VOID * Address = NULL;
-    VOID * Bytevalue = NULL; //Used for Arrays of values
-    size_t sizeInBytes;
+    long long value = 0;       // Universal bucket for 8, 16, 32, and 64-bit integers
+    VOID* Address = NULL;      // The target address in the remote process
+    VOID* Bytevalue = NULL;    // Used for raw byte arrays/strings (dynamic allocation)
+    size_t sizeInBytes = 0;    // Tracks the length of the data (1, 2, 4, 8, etc.)
 
-    MemoryEntry(VOID * Addr, int val) : value(val), Address(Addr) {
-        sizeInBytes = sizeof(val);
-        //std::cout << "MemoryEntry Addr (" << Addr << ") = " << "0x" << std::hex << val << std::endl;
-    }
-    MemoryEntry(VOID* Addr, byte val[], int length){
-        Address = Addr;
-        value = length;
-        for (int i = 0; i < length; i++)
-        {
-            
-        }
-        Bytevalue = malloc(length);
-        memcpy(Bytevalue, val, length);
-        sizeInBytes = length;
-    }
+    // --- Constructor 1: Universal Integer Support ---
+    // Use this for all scan8, scan16, scan32, scan64 calls.
     MemoryEntry(VOID* Addr, byte val[], size_t size) {
         Address = Addr;
         sizeInBytes = size;
+        value = 0; // Initialize bucket to clear old data
+
+        // Copy the raw bytes into our long long bucket. 
+        // This handles Little-Endian correctly automatically.
+        size_t copySize = (size > sizeof(value)) ? sizeof(value) : size;
+        memcpy(&value, val, copySize);
+
+        // Bytevalue remains NULL for standard integer scans to save memory.
+        Bytevalue = NULL;
     }
-    
-    /*
-    * ~MemoryEntry()
-    {
-        if (Bytevalue)
-        {
-            free(&Bytevalue);
+
+    // --- Constructor 2: Single Byte Shortcut ---
+    // Maintains compatibility with your original single-byte logic.
+    MemoryEntry(VOID* Addr, int val) : Address(Addr) {
+        value = (long long)val;
+        sizeInBytes = 1;
+        Bytevalue = NULL;
+    }
+
+    // --- Constructor 3: Raw Byte Array / String Support ---
+    // Use this if you are scanning for large patterns or strings (> 8 bytes).
+    MemoryEntry(VOID* Addr, byte val[], int length) {
+        Address = Addr;
+        sizeInBytes = (size_t)length;
+
+        // Store the first 8 bytes in our quick-access bucket
+        value = 0;
+        size_t headSize = (length > 8) ? 8 : length;
+        memcpy(&value, val, headSize);
+
+        // Allocate heap memory for the full pattern (useful for string 'dump')
+        Bytevalue = malloc(length);
+        if (Bytevalue) {
+            memcpy(Bytevalue, val, length);
         }
     }
-    */
-    
+
+    // Destructor to free malloc'd Bytevalue
+    ~MemoryEntry() {
+        if (Bytevalue) { free(Bytevalue); Bytevalue = NULL; }
+    }
+
+    // Move constructor (for efficient vector storage)
+    MemoryEntry(MemoryEntry&& other) noexcept
+        : value(other.value), Address(other.Address), Bytevalue(other.Bytevalue), sizeInBytes(other.sizeInBytes) {
+        other.Bytevalue = NULL;
+    }
+
+    // Move assignment
+    MemoryEntry& operator=(MemoryEntry&& other) noexcept {
+        if (this != &other) {
+            if (Bytevalue) free(Bytevalue);
+            value = other.value;
+            Address = other.Address;
+            Bytevalue = other.Bytevalue;
+            sizeInBytes = other.sizeInBytes;
+            other.Bytevalue = NULL;
+        }
+        return *this;
+    }
+
+    // Delete copy to prevent accidental shallow copies of malloc'd memory
+        // Deep-copy constructor: duplicates the malloc'd Bytevalue buffer
+    MemoryEntry(const MemoryEntry& other)
+        : value(other.value), Address(other.Address), sizeInBytes(other.sizeInBytes) {
+        if (other.Bytevalue) {
+            Bytevalue = malloc(other.sizeInBytes);
+            if (Bytevalue) {
+                memcpy(Bytevalue, other.Bytevalue, other.sizeInBytes);
+            }
+        }
+        else {
+            Bytevalue = NULL;
+        }
+    }
+
+    // Deep-copy assignment operator
+    MemoryEntry& operator=(const MemoryEntry& other) {
+        if (this != &other) {
+            if (Bytevalue) { free(Bytevalue); Bytevalue = NULL; }
+            value = other.value;
+            Address = other.Address;
+            sizeInBytes = other.sizeInBytes;
+            if (other.Bytevalue) {
+                Bytevalue = malloc(other.sizeInBytes);
+                if (Bytevalue) {
+                    memcpy(Bytevalue, other.Bytevalue, other.sizeInBytes);
+                }
+            }
+            else {
+                Bytevalue = NULL;
+            }
+        }
+        return *this;
+    }
+    // NOTE: If you use Constructor 3 (malloc), ensure you have a 
+    // proper destructor or cleanup logic to avoid memory leaks 
+    // in your own tool's process.
 };
 
 //std::unordered_map<std::string, std::vector<MemoryEntry>> GMemoryMap;
@@ -191,6 +263,50 @@ bool isReadable(DWORD protect) {
         protect & PAGE_EXECUTE_WRITECOPY); // Often readable
 }
 
+// Fast pattern search using memchr for the first byte, then memcmp for the rest.
+// Returns pointer to first match, or nullptr if not found.
+static const BYTE* FastPatternSearch(const BYTE* haystack, size_t haystackSize, const BYTE* needle, size_t needleSize) {
+    if (needleSize == 0 || haystackSize < needleSize) return nullptr;
+    BYTE first = needle[0];
+    size_t lastPossible = haystackSize - needleSize;
+    for (size_t i = 0; i <= lastPossible; ) {
+        const BYTE* found = (const BYTE*)memchr(haystack + i, first, lastPossible - i + 1);
+        if (!found) return nullptr;
+        if (memcmp(found, needle, needleSize) == 0) return found;
+        i = (found - haystack) + 1;
+    }
+    return nullptr;
+}
+
+// Read a memory region in chunks to avoid massive allocations for large regions.
+// Calls the callback for each chunk. Returns total bytes read.
+template<typename Callback>
+static SIZE_T ReadRegionInChunks(HANDLE hProc, void* base, SIZE_T regionSize, SIZE_T chunkSize, Callback&& callback) {
+    SIZE_T totalRead = 0;
+    std::vector<BYTE> buffer;
+    try { buffer.resize(chunkSize); }
+    catch (...) { return 0; }
+    BYTE* current = (BYTE*)base;
+    SIZE_T remaining = regionSize;
+    while (remaining > 0) {
+        SIZE_T toRead = (remaining < chunkSize) ? remaining : chunkSize;
+        SIZE_T bytesRead = 0;
+        if (ReadProcessMemory(hProc, current, buffer.data(), toRead, &bytesRead) && bytesRead > 0) {
+            callback(current, buffer.data(), bytesRead);
+            totalRead += bytesRead;
+            current += bytesRead;
+            remaining -= bytesRead;
+            // Overlap by needleSize-1 to catch patterns spanning chunk boundaries
+            if (remaining > 0 && bytesRead >= 1) {
+                current -= 0; // overlap handled by re-reading tail below
+            }
+        }
+        else {
+            break;
+        }
+    }
+    return totalRead;
+}
 // --- New function to scan ALL committed, readable memory regions ---
 int ScanAllProcessMemory(DWORD processId, HANDLE hProcess, byte BytePattern[], int Bytelength)
 {
@@ -220,7 +336,7 @@ int ScanAllProcessMemory(DWORD processId, HANDLE hProcess, byte BytePattern[], i
         // Also check against guard pages and inaccessible pages
         if (mbi.State == MEM_COMMIT && isReadable(mbi.Protect) && !(mbi.Protect & PAGE_GUARD) && !(mbi.Protect & PAGE_NOACCESS))
         {
-            std::cout << "Scanning Region Base: " << mbi.BaseAddress << " Size: " << mbi.RegionSize << " Protect: 0x" << std::hex << mbi.Protect << std::dec << std::endl;
+            //std::cout << "Scanning Region Base: " << mbi.BaseAddress << " Size: " << mbi.RegionSize << " Protect: 0x" << std::hex << mbi.Protect << std::dec << std::endl;
 
             // Allocate buffer for this region
             // Be careful with VERY large regions - consider reading in chunks
@@ -239,34 +355,23 @@ int ScanAllProcessMemory(DWORD processId, HANDLE hProcess, byte BytePattern[], i
 
                         TotalSizeOfMemory += buffer.size();
 
-                        // *** Use your existing pattern scanning logic here ***
-                        for (size_t i = 0; i + Bytelength <= buffer.size(); ++i) {
-                            bool match = true;
-                            for (int ii = 0; ii < Bytelength; ++ii) {
-                                if (BytePattern[ii] != buffer[i + ii]) {
-                                    match = false;
-                                    break;
-                                }
-                            }
-
-                            if (match) {
-                                // Calculate the absolute address found
-                                VOID* foundAddress = static_cast<char*>(mbi.BaseAddress) + i;
-
-                                // Store the result - Use BaseAddress as the key maybe?
-                                // Or just a single global list if region doesn't matter.
-                                // Using BaseAddress as key:
-                                if (Bytelength == 1) {
-                                    MemoryEntry MemoryEntryToAdd = MemoryEntry(foundAddress, BytePattern[0]);
-                                    GMemoryMap[mbi.BaseAddress].push_back(MemoryEntryToAdd);
-                                }
-                                else {
-                                    MemoryEntry MemoryEntryToAdd = MemoryEntry(foundAddress, BytePattern, Bytelength);
-                                    GMemoryMap[mbi.BaseAddress].push_back(MemoryEntryToAdd);
-                                }
+                        // Fast pattern scan using memchr-accelerated search
+                        {
+                            const BYTE* searchStart = buffer.data();
+                            size_t searchLen = buffer.size();
+                            while (searchLen >= (size_t)Bytelength) {
+                                const BYTE* match = FastPatternSearch(searchStart, searchLen, BytePattern, Bytelength);
+                                if (!match) break;
+                                size_t offset = match - buffer.data();
+                                VOID* foundAddress = static_cast<char*>(mbi.BaseAddress) + offset;
+                                MemoryEntry MemoryEntryToAdd(foundAddress, BytePattern, (size_t)Bytelength);
+                                GMemoryMap[mbi.BaseAddress].push_back(std::move(MemoryEntryToAdd));
                                 TotalADDRFound++;
+                                searchStart = match + 1;
+                                searchLen = buffer.size() - (searchStart - buffer.data());
                             }
-                        } // End pattern scan loop
+                        }
+
                     } // End if bytesRead > 0
                 }
                 else {
@@ -478,7 +583,7 @@ int ReadAllProcModules(DWORD processId, HANDLE hProcess, byte BytePattern[], int
             }
             */
 
-            for (size_t i = 0; i < buffer.size(); i++) {
+            for (size_t i = 0; i + Bytelength <= buffer.size(); i++) {
                 /*
                 if (Bytelength == 1) //This will not work with a pointer
                 {
@@ -627,49 +732,42 @@ void CheckChanged(DWORD processId, HANDLE hProcess, std::unordered_map<VOID*, st
             // Check index validity just in case (shouldn't be needed with correct loop)
             if (i >= static_cast<int>(entryVector.size())) continue;
 
-            MemoryEntry currentEntry = entryVector[i]; // Make a copy to safely access original value
+            MemoryEntry& currentEntry = entryVector[i]; // Make a copy to safely access original value
             VOID* entryAddr = currentEntry.Address;    // Address of the specific byte
 
-            // Buffer to read the current value from memory (1 byte only)
-            byte currentMemValueBuffer[1] = { 0 };
+            size_t readSize = currentEntry.sizeInBytes;
+            if (readSize == 0 || readSize > 8) readSize = 1;
+
+            byte currentMemValueBuffer[8] = { 0 };
             SIZE_T bytesRead = 0;
 
-            if (ReadProcessMemory(hProcess, entryAddr, currentMemValueBuffer, 1, &bytesRead) && bytesRead == 1)
+            if (ReadProcessMemory(hProcess, entryAddr, currentMemValueBuffer, readSize, &bytesRead) && bytesRead == readSize)
             {
-                byte currentMemValue = currentMemValueBuffer[0];
-                // Assumes MemoryEntry.value correctly stores the single previous byte
-                byte previousValue = currentEntry.value;
+                long long currentMemValue = 0;
+                memcpy(&currentMemValue, currentMemValueBuffer, readSize);
 
-                bool valueChanged = (currentMemValue != previousValue);
+                bool valueChanged = (currentMemValue != currentEntry.value);
 
-                // Determine if the current entry should be removed from the vector
                 bool shouldRemoveFromVector = false;
-                if (RemoveIfChangedInsteadOfKeep) { // Mode: Remove if CHANGED
+                if (RemoveIfChangedInsteadOfKeep) {
                     shouldRemoveFromVector = valueChanged;
                 }
-                else { // Mode: Remove if SAME (Keep if Changed)
+                else {
                     shouldRemoveFromVector = !valueChanged;
                 }
 
-                // Perform removal from vector or update the value
                 if (shouldRemoveFromVector) {
                     entryVector.erase(entryVector.begin() + i);
                 }
                 else {
-                    // If we are keeping CHANGED entries (!RemoveIfChangedInsteadOfKeep)
-                    // and the value actually changed, update the stored value.
                     if (!RemoveIfChangedInsteadOfKeep && valueChanged) {
-                        // *** Update the value IN the vector ***
                         entryVector[i].value = currentMemValue;
-
-                        // Optional logging
-                        if (totalAddressesBefore < 20) { // More verbose logging for small sets
+                        if (totalAddressesBefore < 20) {
                             std::cout << "Change Kept: Address: 0x" << std::hex << reinterpret_cast<uintptr_t>(entryAddr)
-                                << " Before: 0x" << (int)previousValue
-                                << " Now: 0x" << (int)currentMemValue << std::dec << std::endl;
+                                << " Before: 0x" << currentEntry.value
+                                << " Now: 0x" << currentMemValue << std::dec << std::endl;
                         }
                     }
-                    // If keeping SAME values (RemoveIfChangedInsteadOfKeep == true && !valueChanged), do nothing.
                 }
             }
             else // ReadProcessMemory failed for this specific address
@@ -724,6 +822,49 @@ void PrintBytesHex(const byte* data, size_t size, std::ostream& os = std::cout) 
 
 void CheckAllRegisters(DWORD processId, HANDLE hProcess, std::unordered_map<VOID*, std::vector<MemoryEntry>>& LMemoryMap, byte Pattern[])
 {
+    byte currentMemoryValueBuffer[8];
+
+    // We iterate through the map
+    for (auto itMap = LMemoryMap.begin(); itMap != LMemoryMap.end(); ) {
+        std::vector<MemoryEntry>& entries = itMap->second;
+
+        for (int i = static_cast<int>(entries.size()) - 1; i >= 0; --i) {
+            MemoryEntry& entry = entries[i];
+            SIZE_T bytesRead = 0;
+
+            if (ReadProcessMemory(hProcess, entry.Address, currentMemoryValueBuffer, entry.sizeInBytes, &bytesRead)) {
+                // Perform a byte-by-byte comparison against the new pattern
+                if (memcmp(currentMemoryValueBuffer, Pattern, entry.sizeInBytes) != 0) {
+                    // Mismatch - remove from cache
+                    entries.erase(entries.begin() + i);
+                    TotalADDRFound--;
+                }
+                else {
+                    // Match found! Update the cached value to the new matched pattern
+                    // This is important for "changed"/"same" logic later
+                    memcpy(&entry.value, currentMemoryValueBuffer, entry.sizeInBytes);
+                }
+            }
+            else {
+                // Memory no longer readable (e.g., deallocated)
+                entries.erase(entries.begin() + i);
+                TotalADDRFound--;
+            }
+        }
+
+        // Clean up empty regions in the map
+        if (entries.empty()) {
+            itMap = LMemoryMap.erase(itMap);
+        }
+        else {
+            ++itMap;
+        }
+    }
+    std::cout << "Refinement complete. Remaining: " << TotalADDRFound << std::endl;
+}
+
+void CheckAllRegistersOld(DWORD processId, HANDLE hProcess, std::unordered_map<VOID*, std::vector<MemoryEntry>>& LMemoryMap, byte Pattern[])
+{
     // Buffer for reading memory. Max size for a 64-bit value is 8 bytes.
     byte currentMemoryValueBuffer[8];
 
@@ -742,7 +883,7 @@ void CheckAllRegisters(DWORD processId, HANDLE hProcess, std::unordered_map<VOID
         {
             // Get a copy of the current entry. If MemoryEntry is large, consider using a reference
             // up to the point of potential erasure, but a copy is safer if its fields are modified locally.
-            MemoryEntry currentEntry = entriesInVector.at(i);
+            MemoryEntry& currentEntry = entriesInVector.at(i);
             VOID* entryAddress = currentEntry.Address;
             size_t valueSizeInBytes = currentEntry.sizeInBytes; // This field MUST exist in your MemoryEntry struct
 
@@ -835,7 +976,7 @@ void DumpMemory()
         PageCount++;
         //MemoryModule key = pair.first;
         VOID* key = pair.first;
-        std::vector<MemoryEntry> obj = pair.second;
+        const std::vector<MemoryEntry>& obj = pair.second;
         /*
             for (const auto& obj : GMemoryMap["key1"]) {
                 std::cout << obj.value << "\n";
@@ -849,44 +990,44 @@ void DumpMemory()
 
                 if (myobj.Bytevalue == NULL)
                 {
-                    char buffer[1] = { 0 };
-                    if (!ReadProcessMemory(hProcess, ObjAddr, &buffer, 1, nullptr))
+                    byte buffer[8] = { 0 };
+                    size_t readSize = myobj.sizeInBytes;
+                    if (readSize == 0 || readSize > 8) readSize = 1;
+                    if (!ReadProcessMemory(hProcess, ObjAddr, buffer, readSize, nullptr))
                     {
                         //Unable to get mem
                     }
-                    std::cout << "ModuleAddress: 0x" << std::hex << key << " Address: " << myobj.Address << " - InCache:" << std::dec << myobj.value << " InMem: " << int(buffer[0]) << "\n";
+                    long long memValue = 0;
+                    memcpy(&memValue, buffer, readSize);
+                    std::cout << "ModuleAddress: 0x" << std::hex << key
+                        << " Address: " << myobj.Address
+                        << " - InCache: 0x" << myobj.value
+                        << " InMem: 0x" << memValue
+                        << " (" << (readSize * 8) << "-bit)\n";
                 }
                 else
                 {
-                    unsigned char * buffer = (unsigned char *)(malloc(myobj.value));
-                    if (!ReadProcessMemory(hProcess, ObjAddr, buffer, myobj.value, nullptr))
+                    unsigned char* buffer = (unsigned char*)(malloc(myobj.sizeInBytes));
+                    if (!ReadProcessMemory(hProcess, ObjAddr, buffer, myobj.sizeInBytes, nullptr))
                     {
                         //Unable to get mem
                     }
-                    std::cout << "ModuleAddress: 0x" << std::hex << key << " Address: " << myobj.Address << " - ByteLen:" << std::dec << myobj.value << "\n";
-                    unsigned char * bytePtr = static_cast<unsigned char*>(myobj.Bytevalue);
+                    std::cout << "ModuleAddress: 0x" << std::hex << key << " Address: " << myobj.Address << " - ByteLen:" << std::dec << myobj.sizeInBytes << "\n";
+                    unsigned char* bytePtr = static_cast<unsigned char*>(myobj.Bytevalue);
 
                     std::cout << "InCache: ";
-                    for (size_t i = 0; i < std::min<size_t>(16, myobj.value); i++) {
+                    for (size_t i = 0; i < std::min<size_t>(16, myobj.sizeInBytes); i++) {
                         std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytePtr[i]) << " ";
                     }
                     std::cout << std::endl;
 
-                    std::cout << "InMem  : ";
+                    std::cout << "InMem: ";
 
-                    for (size_t i = 0; i < std::min<size_t>(16, myobj.value); i++) {
+                    for (size_t i = 0; i < std::min<size_t>(16, myobj.sizeInBytes); i++) {
                         std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(buffer[i]) << " ";
                     }
                     std::cout << std::endl;
 
-                    /*
-                    if (!WriteProcessMemory(hProcess, myobj.Bytevalue, (void *)buffer, 1, nullptr)) {
-                        std::cerr << "Failed to write memory at address: " << myobj.Bytevalue << std::endl;
-                    }
-                    else {
-                        std::cout << "Successfully updated " << myobj.value << " bytes from address " << ObjAddr << " to " << myobj.Bytevalue << std::endl;
-                    }
-                    */
                     free(buffer);
                 }
                 ItemCount++;
@@ -895,7 +1036,7 @@ void DumpMemory()
 
     //std::vector<MemoryEntry> Memory = GMemoryMap[1];
 
-    std::cout << std::endl << "LMemoryMap - PageCount:" << std::dec << PageCount << " ItemCount" << ItemCount << std::endl;
+    std::cout << std::endl << "LMemoryMap - PageCount:" << std::dec << PageCount << " ItemCount: " << ItemCount << std::endl;
 }
 
 DWORD GetProcId(const wchar_t* procName)
@@ -1077,6 +1218,8 @@ Available commands:
   stopwatch       (NYI) Stop monitoring memory for changes.
   dump            (NYI) Print information about loaded modules or memory regions.
   recentlyremoved (NYI) Display recently removed memory addresses.
+  freeze          Freeze all cached addresses (continuously writes cached value back).
+  unfreeze        Stop freezing and let the game control those addresses again.
 
 --- General ---
   help            Display this help message.
@@ -1093,39 +1236,59 @@ void DisplayVersion()
 
 bool stopFlag = false;
 
-void threadFunction() {
-    while (true)
+bool freezeFlag = false;
+std::thread freezeThread;
+
+void freezeFunction() {
+    while (!freezeFlag)
     {
-        if (stopFlag) { break; }
-        byte Buffer[1] = { 0 };
         for (auto& pair : GMemoryMap) {
-            if (stopFlag) { break; }
+            if (freezeFlag) break;
+            for (auto& entry : pair.second) {
+                if (freezeFlag) break;
+                size_t writeSize = entry.sizeInBytes;
+                if (writeSize == 0 || writeSize > 8) continue;
+                // Write the cached value back to memory
+                WriteProcessMemory(hProcess, entry.Address, &entry.value, writeSize, nullptr);
+            }
+        }
+        if (!freezeFlag) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+
+void threadFunction() {
+    while (!stopFlag)
+    {
+        byte Buffer[8] = { 0 };
+        for (auto& pair : GMemoryMap) {
+            if (stopFlag) break;
             VOID* key = pair.first;
             std::vector<MemoryEntry>& Tempobj = pair.second;
 
-            for (int i = pair.second.size() - 1; i >= 0; i--)
+            for (int i = static_cast<int>(pair.second.size()) - 1; i >= 0; i--)
             {
-                if (stopFlag) { break; }
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                MemoryEntry & Obj = pair.second.at(i);
+                if (stopFlag) break;
+                MemoryEntry& Obj = pair.second.at(i);
                 VOID* ObjAddr = Obj.Address;
-                if (ReadProcessMemory(hProcess, ObjAddr, &Buffer, 1, nullptr))
+                size_t readSize = Obj.sizeInBytes;
+                if (readSize == 0 || readSize > 8) readSize = 1; // safety clamp
+
+                if (ReadProcessMemory(hProcess, ObjAddr, Buffer, readSize, nullptr))
                 {
-                    char a = Buffer[0];
-                    char b = Obj.value;
-                    if (a != b)
-                    {
-                        //std::cout << "ModuleAddress: 0x" << std::hex << key << " Address: " << ObjAddr << " - Value: 0x" << std::hex << Obj.value << " Compared to: 0x" << (int)(Buffer[0]) << "\n";
-                        //Tempobj.erase(Tempobj.begin() + i);
+                    // Build the current value from the buffer
+                    long long currentValue = 0;
+                    memcpy(&currentValue, Buffer, readSize);
 
-                        std::cout << "Watch found a value change @ ModuleAddress: 0x" << std::hex << key << " Address: " << ObjAddr << " - BeforeValue: 0x" << std::hex << Obj.value << " NowValue: 0x" << std::hex << (int)(Buffer[0]) << "\n";
-                        Obj.value = Buffer[0];
-
-                        //TotalADDRFound -= 1;
-                    }
-                    else
+                    if (currentValue != Obj.value)
                     {
-                        //std::cout << "Keeping ModuleAddress: 0x" << std::hex << key << " Address: " << ObjAddr << " - BeforeValue: 0x" << std::hex << Obj.value << " NowValue: 0x" << std::hex << (int)(Buffer[0]) << " Compared to: 0x" << int(Pattern[0]) << "\n";
+                        std::cout << "Watch found a value change @ ModuleAddress: 0x" << std::hex << key
+                            << " Address: " << ObjAddr
+                            << " - BeforeValue: 0x" << Obj.value
+                            << " NowValue: 0x" << currentValue
+                            << " (" << (readSize * 8) << "-bit)\n";
+                        Obj.value = currentValue;
                     }
                 }
                 else
@@ -1134,11 +1297,11 @@ void threadFunction() {
                 }
             }
         }
-        if (stopFlag) { break; }
+        if (!stopFlag) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
-    
 }
-
 // Parses input like "1,3,5" or "2-4" or "1, 3-5, 9" into a set of 0-based indices
 // Returns false if parsing fails or an index is out of bounds.
 bool ParseIndices(const std::string& input, size_t maxValidIndex, std::set<size_t>& selectedIndices) {
@@ -1219,7 +1382,6 @@ void menu(const std::string& userInput)
 
     if (userInput == "ProcessName") {
         std::string ProcessName;
-        std::cout << "Process Image Name (ex. notepad.exe): ";
 
         std::getline(std::cin, ProcessName);
         //processId = GetProcId((const * wchar_t)ProcessName);
@@ -1268,10 +1430,12 @@ void menu(const std::string& userInput)
         else {
             // ProcessName was empty after trimming
             std::cerr << "Process name is empty." << std::endl;
+            std::cout << "Process Image Name (ex. notepad.exe): ";
             processId = 0; // Ensure processId is zeroed
         }
 
         hProcess = OpenProcess(PROCESS_ALL_ACCESS, NULL, processId);
+        std::cout << "Process Image Set (ex. " << ProcessName << "): ";
         //MyArrayListOfAddresses.clear();
     }
     else if (userInput == "hook")
@@ -1721,6 +1885,34 @@ void menu(const std::string& userInput)
     {
         stopFlag = true;
     }
+    else if (userInput == "freeze") {
+        if (GMemoryMap.empty()) {
+            std::cerr << "No addresses in memory map. Perform a scan first." << std::endl;
+        }
+        else {
+            // Update all cached values to current memory before freezing
+            for (auto& pair : GMemoryMap) {
+                for (auto& entry : pair.second) {
+                    size_t readSize = entry.sizeInBytes;
+                    if (readSize == 0 || readSize > 8) continue;
+                    byte buf[8] = { 0 };
+                    if (ReadProcessMemory(hProcess, entry.Address, buf, readSize, nullptr)) {
+                        entry.value = 0;
+                        memcpy(&entry.value, buf, readSize);
+                    }
+                }
+            }
+            freezeFlag = false;
+            if (freezeThread.joinable()) freezeThread.join();
+            freezeThread = std::thread(freezeFunction);
+            std::cout << "Froze " << TotalADDRFound << " addresses." << std::endl;
+        }
+    }
+    else if (userInput == "unfreeze") {
+        freezeFlag = true;
+        if (freezeThread.joinable()) freezeThread.join();
+        std::cout << "Unfroze all addresses." << std::endl;
+    }
     else if (userInput == "dump") 
     {
         PrintModules(processId, hProcess);
@@ -1922,11 +2114,13 @@ void menu(const std::string& userInput)
                         << ". Range: " << min_val << " to " << max_val << "." << std::endl;
 
                     // --- 2. Consolidate addresses and check count ---
-                    std::vector<MemoryEntry> flatEntryList;
+                    std::vector<VOID*> flatAddressList;
                     for (const auto& pair_map_entry : GMemoryMap) {
-                        flatEntryList.insert(flatEntryList.end(), pair_map_entry.second.begin(), pair_map_entry.second.end());
+                        for (const auto& entry : pair_map_entry.second) {
+                            flatAddressList.push_back(entry.Address);
+                        }
                     }
-                    size_t totalFound = flatEntryList.size();
+                    size_t totalFound = flatAddressList.size();
 
                     if (totalFound == 0) {
                         std::cerr << "No addresses found in memory map. Perform a scan first." << std::endl;
@@ -1940,7 +2134,7 @@ void menu(const std::string& userInput)
                         if (totalFound <= 10) { // Or some other threshold for listing
                             std::cout << "Select addresses to write to by index:" << std::endl;
                             for (size_t i = 0; i < totalFound; ++i) {
-                                std::cout << "[" << (i + 1) << "] 0x" << std::hex << reinterpret_cast<uintptr_t>(flatEntryList[i].Address) << std::dec << std::endl;
+                                std::cout << "[" << (i + 1) << "] 0x" << std::hex << reinterpret_cast<uintptr_t>(flatAddressList[i]) << std::dec << std::endl;
                             }
                             std::cout << "Enter index/indices (e.g., 1,3,5 or 2-4): "; // Prompt for indices ONLY
                             std::string indexInput;
@@ -1952,14 +2146,14 @@ void menu(const std::string& userInput)
                                 for (size_t zero_based_index_from_set : selectedIndices) {
                                     // Check if the 0-based index is within the valid range for flatEntryList
                                     // Valid 0-based indices are from 0 to flatEntryList.size() - 1
-                                    if (zero_based_index_from_set < flatEntryList.size()) {
-                                        targetAddresses.push_back(flatEntryList[zero_based_index_from_set].Address); // Use the 0-based index directly
+                                    if (zero_based_index_from_set < flatAddressList.size()) {
+                                        targetAddresses.push_back(flatAddressList[zero_based_index_from_set]); // Use the 0-based index directly
                                     }
                                     else {
                                         // This case should ideally not happen if ParseIndices validates correctly against totalFound
                                         std::cerr << "Warning: Index " << zero_based_index_from_set
                                             << " obtained from ParseIndices is out of range for available addresses (count: "
-                                            << flatEntryList.size() << ")." << std::endl;
+                                            << flatAddressList.size() << ")." << std::endl;
                                     }
                                 }
                                 targetsSelected = !targetAddresses.empty();
@@ -1983,11 +2177,11 @@ void menu(const std::string& userInput)
                             // Corrected line for prompting with an example address:
                             std::cout << "Enter target address (e.g., 0x"; // Output the prefix part
 
-                            if (flatEntryList.empty() || flatEntryList[0].Address == nullptr) { // Check if list is empty or first address is null
+                            if (flatAddressList.empty() || flatAddressList[0] == nullptr) { // Check if list is empty or first address is null
                                 std::cout << "ADDRESS"; // Output placeholder if no valid example address
                             }
                             else {
-                                std::cout << std::hex << reinterpret_cast<uintptr_t>(flatEntryList[0].Address); // Output std::hex, then the address
+                                std::cout << std::hex << reinterpret_cast<uintptr_t>(flatAddressList[0]); // Output std::hex, then the address
                             }
 
                             std::cout << std::dec << ") or 'all': "; // Output std::dec to reset, then the suffix part
@@ -2001,8 +2195,8 @@ void menu(const std::string& userInput)
 
 
                             if (addrInput == "all") {
-                                for (const auto& entry : flatEntryList) {
-                                    targetAddresses.push_back(entry.Address);
+                                for (VOID* addr : flatAddressList) {
+                                    targetAddresses.push_back(addr);
                                 }
                                 targetsSelected = !targetAddresses.empty();
                             }
@@ -2126,6 +2320,11 @@ int main()
     std::cout << "Press Any Key to continue:\n";
     getchar();
     */
+
+    freezeFlag = true;
+    if (freezeThread.joinable()) freezeThread.join();
+    stopFlag = true;
+    if (t.joinable()) t.join();
 
     // Close the process handle
     CloseHandle(hProcess);

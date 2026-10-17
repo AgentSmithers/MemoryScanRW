@@ -11,6 +11,10 @@ FARPROC originalFunc;
 BYTE g_OriginalBytes[14];
 DWORD g_OldProtect = 0;
 
+// Forward declarations for functions defined in main.cpp
+void SuspendProcess(DWORD processId);
+void ResumeProcess(DWORD processId);
+
 // A small x64 shellcode that returns 123456 (0x1E240).
 // In pure x64 assembly, that might look like:
 //   mov eax, 123456
@@ -144,6 +148,9 @@ BOOL HookRemoteGetTickCount(HANDLE hProcess)
     patch[12] = 0x90; // nop
     patch[13] = 0x90; // nop
 
+    // Suspend target process threads to prevent execution during patch
+    SuspendProcess(pid);
+
     // 8) Change protection so we can write to the remote function start
     if (!VirtualProtectEx(hProcess, remoteGetTickCount, 14, PAGE_EXECUTE_READWRITE, &g_OldProtect)) {
         std::cerr << "[!] VirtualProtectEx failed.\n";
@@ -161,6 +168,8 @@ BOOL HookRemoteGetTickCount(HANDLE hProcess)
     // 10) Restore protection
     DWORD tempProtect = 0;
     VirtualProtectEx(hProcess, remoteGetTickCount, 14, g_OldProtect, &tempProtect);
+
+    ResumeProcess(pid);
 
     std::cout << "[+] Successfully hooked remote GetTickCount to our HookedGetTickCount.\n";
     return TRUE;
@@ -362,9 +371,19 @@ void x86Hook() {
     // Make the memory writable
     VirtualProtect((LPVOID)originalFunc, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
 
+    // Validate that both addresses fit in 32-bit range for rel32 jump
+    uintptr_t target = reinterpret_cast<uintptr_t>(HookedGetTickCount);
+    uintptr_t src = reinterpret_cast<uintptr_t>(originalFunc);
+    intptr_t rel = static_cast<intptr_t>(target - src - 5);
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+        std::cerr << "[!] x86Hook: relative offset exceeds 32-bit range. Use x64 hook instead.\n";
+        VirtualProtect((LPVOID)originalFunc, 5, oldProtect, &oldProtect);
+        return;
+    }
+
     // Write the jump instruction
     BYTE jmp[5] = { 0xE9 };
-    *(DWORD*)(jmp + 1) = (DWORD)HookedGetTickCount - (DWORD)originalFunc - 5;
+    *(int32_t*)(jmp + 1) = static_cast<int32_t>(rel);
     memcpy((LPVOID)originalFunc, jmp, 5);
 
     VirtualProtect((LPVOID)originalFunc, 5, oldProtect, &oldProtect);
