@@ -101,7 +101,7 @@ AgentSmithers MemoryScanRW is a command-line utility for Windows, written in C++
 * `watch`: Starts a background thread to monitor cached 1-byte values for changes. Reports and updates on change.
 * `stopwatch`: Stops the `watch` thread.
 * `dump`: Prints loaded modules of the target process and dumps the currently cached memory addresses with their values.
-* `recentlyremoved`: (Not Yet Implemented)
+* `recentlyremoved`: Displays the last 50 addresses that were removed from the cache by `same`, `changed`, refinement scans, or became unreadable. Shows the address, last known value, bit width, and removal reason.
 * `freeze`: Continuously writes each cached address's stored value back to memory (~100 writes/sec), effectively locking the value in place. The game/process cannot change frozen addresses until `unfreeze` is issued.
 * `unfreeze`: Stops the freeze thread, allowing the target process to modify the previously frozen addresses again.
 

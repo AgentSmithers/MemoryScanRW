@@ -322,6 +322,7 @@ int ScanAllProcessMemory(DWORD processId, HANDLE hProcess, byte BytePattern[], i
     TotalADDRFound = 0;
     TotalSizeOfMemory = 0;
     GMemoryMap.clear(); // Clear previous results if needed
+    RecentlyRemoved.clear();
 
     MEMORY_BASIC_INFORMATION mbi;
     // Use unsigned pointer type for address arithmetic
@@ -414,6 +415,7 @@ int ScanHeapAndStackMemory(DWORD processId, HANDLE hProcess, byte BytePattern[],
     TotalADDRFound = 0;
     TotalSizeOfMemory = 0;
     GMemoryMap.clear();
+    RecentlyRemoved.clear();
 
     MEMORY_BASIC_INFORMATION mbi;
     // Start querying from the beginning of the process's address space
@@ -757,6 +759,12 @@ void CheckChanged(DWORD processId, HANDLE hProcess, std::unordered_map<VOID*, st
                 }
 
                 if (shouldRemoveFromVector) {
+                    RemovedEntry re;
+                    re.Address = currentEntry.Address;
+                    re.sizeInBytes = currentEntry.sizeInBytes;
+                    re.lastKnownValue = currentEntry.value;
+                    re.reason = RemoveIfChangedInsteadOfKeep ? "same" : "changed";
+                    RecentlyRemoved.push_back(std::move(re));
                     entryVector.erase(entryVector.begin() + i);
                 }
                 else {
@@ -776,6 +784,12 @@ void CheckChanged(DWORD processId, HANDLE hProcess, std::unordered_map<VOID*, st
                 std::cerr << "Warning: Unable to read from address 0x" << std::hex << reinterpret_cast<uintptr_t>(entryAddr)
                     << ". Error: " << lastError << ". Removing entry from list." << std::dec << std::endl;
                 // Remove entry from vector if memory becomes unreadable
+                RemovedEntry re;
+                re.Address = currentEntry.Address;
+                re.sizeInBytes = currentEntry.sizeInBytes;
+                re.lastKnownValue = currentEntry.value;
+                re.reason = "unreadable";
+                RecentlyRemoved.push_back(std::move(re));
                 entryVector.erase(entryVector.begin() + i);
             }
         } // End inner loop (vector iteration)
@@ -836,6 +850,12 @@ void CheckAllRegisters(DWORD processId, HANDLE hProcess, std::unordered_map<VOID
                 // Perform a byte-by-byte comparison against the new pattern
                 if (memcmp(currentMemoryValueBuffer, Pattern, entry.sizeInBytes) != 0) {
                     // Mismatch - remove from cache
+                    RemovedEntry re;
+                    re.Address = entry.Address;
+                    re.sizeInBytes = entry.sizeInBytes;
+                    re.lastKnownValue = entry.value;
+                    re.reason = "refine";
+                    RecentlyRemoved.push_back(std::move(re));
                     entries.erase(entries.begin() + i);
                     TotalADDRFound--;
                 }
@@ -847,6 +867,12 @@ void CheckAllRegisters(DWORD processId, HANDLE hProcess, std::unordered_map<VOID
             }
             else {
                 // Memory no longer readable (e.g., deallocated)
+                RemovedEntry re;
+                re.Address = entry.Address;
+                re.sizeInBytes = entry.sizeInBytes;
+                re.lastKnownValue = entry.value;
+                re.reason = "unreadable";
+                RecentlyRemoved.push_back(std::move(re));
                 entries.erase(entries.begin() + i);
                 TotalADDRFound--;
             }
@@ -1217,7 +1243,7 @@ Available commands:
   watch           (NYI) Start monitoring cached memory for changes.
   stopwatch       (NYI) Stop monitoring memory for changes.
   dump            (NYI) Print information about loaded modules or memory regions.
-  recentlyremoved (NYI) Display recently removed memory addresses.
+  recentlyremoved Display addresses removed by recent refinements/filters (last 50 shown).
   freeze          Freeze all cached addresses (continuously writes cached value back).
   unfreeze        Stop freezing and let the game control those addresses again.
 
@@ -1238,6 +1264,14 @@ bool stopFlag = false;
 
 bool freezeFlag = false;
 std::thread freezeThread;
+
+struct RemovedEntry {
+    VOID* Address;
+    size_t sizeInBytes;
+    long long lastKnownValue;
+    std::string reason; // "same", "changed", "refine", "unreadable"
+};
+std::vector<RemovedEntry> RecentlyRemoved;
 
 void freezeFunction() {
     while (!freezeFlag)
@@ -1919,28 +1953,30 @@ void menu(const std::string& userInput)
         DumpMemory();
     }
     else if (userInput == "recentlyremoved") {
-        /*
-        for (const auto& entry : MyArrayListOfAddressesRecentlyRemoved) {
-            //std::cout << std::hex << entry.first << std::endl;
-            std::cout << "BEFORE: ";
-            
-            
-            for (const auto& byteValue : entry.second.first) {
-                //std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byteValue) << " ";
-            }
-            std::cout << std::endl;
-            std::cout << "AFTER: ";
-            for (const auto& byteValue : entry.second.second) {
-                //std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byteValue) << " ";
-            }
-            
-            std::cout << std::endl << std::endl;
+        if (RecentlyRemoved.empty()) {
+            std::cout << "No recently removed addresses." << std::endl;
         }
-        */
+        else {
+            std::cout << "Recently removed addresses (" << RecentlyRemoved.size() << " total):" << std::endl;
+            // Show last 50 max to avoid flooding
+            size_t start = (RecentlyRemoved.size() > 50) ? RecentlyRemoved.size() - 50 : 0;
+            for (size_t i = start; i < RecentlyRemoved.size(); i++) {
+                const RemovedEntry& re = RecentlyRemoved[i];
+                std::cout << "  [" << (i + 1) << "] 0x" << std::hex
+                    << reinterpret_cast<uintptr_t>(re.Address)
+                    << " LastVal: 0x" << re.lastKnownValue
+                    << " (" << (re.sizeInBytes * 8) << "-bit)"
+                    << " Reason: " << re.reason << std::dec << std::endl;
+            }
+            if (RecentlyRemoved.size() > 50) {
+                std::cout << "  ... (" << (RecentlyRemoved.size() - 50) << " older entries omitted)" << std::endl;
+            }
+        }
     }
     else if (userInput == "clear") {
         std::cout << "Memory list cleared" << std::endl;
         GMemoryMap.clear();
+        RecentlyRemoved.clear();
     }
     else if (userInput == "suspend") {
         SuspendProcess(processId);
